@@ -77,24 +77,73 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(len(app.dataframe[0].value), 0)
 
     def test_cas_upload_preview_without_database_write(self) -> None:
-        """Parse an uploaded workbook into a session preview without opening the vault."""
-        from openpyxl import Workbook
-
-        workbook = Workbook()
-        workbook.active.append(["ISIN", "Security Name", "Quantity", "Market Value"])
-        workbook.active.append(["INE000A01010", "Synthetic Security", "12.50", "1250.00"])
-        stream = BytesIO()
-        workbook.save(stream)
-        workbook.close()
-        uploaded = SimpleNamespace(name="synthetic.xlsx", size=len(stream.getvalue()), getvalue=stream.getvalue)
-        with patch("streamlit.file_uploader", return_value=uploaded):
+        """Parse uploaded CSV into a session preview without opening the vault."""
+        stream = BytesIO(
+            b"DP ID:00000001\nClient ID:00000002\nDP Name:Synthetic Broker\n"
+            b"ISIN,ISIN Name,Quantity,Last Closing Price,Market Value\n"
+            b"INE000A01010,Synthetic Equity Shares,12.50,100,1250.00\n"
+            b"INF000A01010,Synthetic Bond Fund,2,10,20\n"
+            b"INE000A07010,Synthetic NCD,3,10,30\n"
+        )
+        uploaded = SimpleNamespace(name="synthetic.csv", size=len(stream.getvalue()), getvalue=stream.getvalue)
+        with patch("streamlit.file_uploader", return_value=uploaded) as uploader:
             app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            self.assertEqual(uploader.call_args.kwargs["type"], ["pdf", "csv"])
             app.button[1].click().run()
             self.assertFalse(app.exception)
             self.assertFalse(app.error)
             self.assertEqual(app.dataframe[0].value.iloc[0]["ISIN"], "INE000A01010")
             self.assertEqual(app.dataframe[0].value.iloc[0]["Quantity"], "12.50")
+            self.assertEqual(app.dataframe[0].value.iloc[0]["Security"], "Synthetic Equity Shares")
+            self.assertEqual(app.dataframe[0].value["Asset Class"].tolist(), ["Stock", "Mutual Fund", "Bond"])
+            self.assertEqual(app.dataframe[0].value.iloc[0]["Statement Price"], "100")
+            self.assertEqual(app.dataframe[0].value.iloc[0]["Broker / DP"], "Synthetic Broker")
+            self.assertEqual(app.dataframe[0].value.iloc[0]["Account"], "DP ****0001 / Client ****0002")
+            app.checkbox[0].check().run()
+            self.assertEqual(app.dataframe[0].value.iloc[0]["Account"], "demat:00000001:00000002")
             self.assertFalse(self.path.exists())
+
+    def test_inr_distribution_renders(self) -> None:
+        """Exercise the chart and holdings table with the current width API."""
+        database = Database(self.path)
+        database.initialize()
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO current_holdings VALUES (?, ?, ?, ?, ?, ?)",
+                ("DEMO", "TEST", "EQUITY", "INR", "2", "10.50"),
+            )
+        app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+        app.button[0].click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(len(app.get("plotly_chart")), 1)
+        self.assertEqual(len(app.dataframe[0].value), 1)
+
+    def test_broker_display_alias_preserves_provenance(self) -> None:
+        """Shorten only the recognized legal name and retain original parsed metadata."""
+        from ingestion.parsers import CdslCasParser
+        from ui.app import broker_label, cas_preview_frame
+
+        for name in ("GROWW INVEST TECH PRIVATE LIMITED", " groww  invest tech private limited "):
+            self.assertEqual(broker_label(name), "Groww")
+        for name in ("ZERODHA BROKING LIMITED", " zerodha  broking limited "):
+            self.assertEqual(broker_label(name), "Zerodha")
+        self.assertEqual(broker_label("Synthetic Broker"), "Synthetic Broker")
+        self.assertEqual(broker_label("Groww Unrelated Entity"), "Groww Unrelated Entity")
+        self.assertEqual(broker_label(None), "Unknown")
+        self.assertEqual(broker_label("  "), "Unknown")
+        rows = CdslCasParser().parse_bytes(
+            b"DP Name:GROWW INVEST TECH PRIVATE LIMITED\nISIN,Balance\nINE000A01010,1", ".csv",
+        )
+        self.assertEqual(cas_preview_frame(rows, False).iloc[0]["Broker / DP"], "Groww")
+        self.assertEqual(rows[0]["broker"], "GROWW INVEST TECH PRIVATE LIMITED")
+        gold_rows = CdslCasParser().parse_bytes(
+            b"DP Name:ZERODHA BROKING LIMITED\nISIN,ISIN Name,Balance\n"
+            b"INF000A01010,Synthetic AMC#Synthetic MF-Synthetic ETF GOLD,1", ".csv",
+        )
+        frame = cas_preview_frame(gold_rows, False)
+        self.assertEqual(frame.iloc[0]["Broker / DP"], "Zerodha")
+        self.assertEqual(frame.iloc[0]["Asset Class"], "Gold ETF")
+        self.assertEqual(gold_rows[0]["broker"], "ZERODHA BROKING LIMITED")
 
     def test_cas_failure_clears_password_and_preview(self) -> None:
         """Surface a safe failure and clear sensitive/stale state after a bad PDF."""

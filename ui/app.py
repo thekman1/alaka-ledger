@@ -18,7 +18,7 @@ from core.portfolio_engine import (
     format_money,
     summarize_holdings,
 )
-from ingestion.base_parser import ParsingError
+from ingestion.base_parser import ParsedHolding, ParsingError
 from ingestion.parsers import CdslCasParser
 
 _COLUMNS = ["ticker", "broker", "asset_class", "native_currency", "total_quantity", "avg_buy_price"]
@@ -83,7 +83,7 @@ def render_distribution(summary: PortfolioSummary) -> None:
         font=dict(family="monospace", color="#20292B", size=12),
         legend=dict(orientation="h", y=-0.08, x=0.5, xanchor="center"),
     )
-    st.plotly_chart(figure, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(figure, width="stretch", config={"displayModeBar": False})
 
 
 def render_metrics(summary: PortfolioSummary, fx: Optional[FxResult]) -> None:
@@ -132,7 +132,7 @@ def render_grid(holdings: List[Dict[str, str]]) -> None:
         "native_currency": "Currency", "total_quantity": "Quantity", "avg_buy_price": "Average Buy Price",
     })
     st.caption(f"{total:,} holdings | Page {int(page)} of {pages}")
-    st.dataframe(visible, hide_index=True, use_container_width=True, height=420)
+    st.dataframe(visible, hide_index=True, width="stretch", height=420)
 
 
 def clear_cas_preview() -> None:
@@ -151,11 +151,46 @@ def parse_cas_upload(content: bytes, suffix: str) -> None:
         st.session_state["cas_error"] = str(error)
 
 
+def account_label(row: ParsedHolding, show_full: bool) -> str:
+    """Mask account identifiers unless the user explicitly requests full provenance."""
+    account_id, dp_id, client_id = row.get("account_id"), row.get("dp_id"), row.get("client_id")
+    if not account_id or not dp_id or not client_id:
+        return "Unknown"
+    return account_id if show_full else f"DP ****{dp_id[-4:]} / Client ****{client_id[-4:]}"
+
+
+def broker_label(name: Optional[str]) -> str:
+    """Use a familiar display name without modifying reported broker provenance."""
+    label = " ".join((name or "").split())
+    if label.casefold() == "groww invest tech private limited":
+        return "Groww"
+    if label.casefold() == "zerodha broking limited":
+        return "Zerodha"
+    return label or "Unknown"
+
+
+def cas_preview_frame(preview: List[ParsedHolding], show_account_ids: bool) -> pd.DataFrame:
+    """Format snapshot values and account provenance without changing parsed records."""
+    return pd.DataFrame([
+        {
+            "Broker / DP": broker_label(row.get("broker")),
+            "Account": account_label(row, show_account_ids),
+            "ISIN": row["isin"], "Security": row["security_name"],
+            "Asset Class": row.get("asset_class", "Unclassified"),
+            "Quantity": str(row["quantity"]), "Currency": row["native_currency"],
+            "Statement Price": str(row["price"]) if row["price"] is not None else "-",
+            "Statement Value": str(row["market_value"]) if row["market_value"] is not None else "-",
+            "Source": row["source"],
+        }
+        for row in preview
+    ])
+
+
 def render_cas_import() -> None:
     """Accept a local CAS upload without changing persisted cost-basis holdings."""
     with st.expander("Import CAS", expanded=True):
         uploaded = st.file_uploader(
-            "CAS Statement", type=["pdf", "xlsx"], key="cas_upload",
+            "CAS Statement", type=["pdf", "csv"], key="cas_upload",
             on_change=clear_cas_preview,
         )
         if uploaded is not None:
@@ -175,17 +210,11 @@ def render_cas_import() -> None:
         if preview:
             st.subheader("CAS Snapshot")
             st.caption(f"Unsaved snapshot | {len(preview):,} holdings | Statement values, not acquisition costs")
-            frame = pd.DataFrame([
-                {
-                    "ISIN": row["isin"], "Security": row["security_name"],
-                    "Quantity": str(row["quantity"]), "Currency": row["native_currency"],
-                    "Statement Price": str(row["price"]) if row["price"] is not None else "-",
-                    "Statement Value": str(row["market_value"]) if row["market_value"] is not None else "-",
-                    "Source": row["source"],
-                }
-                for row in preview
-            ])
-            st.dataframe(frame, hide_index=True, use_container_width=True)
+            show_account_ids = st.checkbox("Show full account IDs", value=False)
+            if any(row.get("account_id") is None for row in preview):
+                st.warning("Some holdings have no complete account identity and cannot be linked automatically.")
+            frame = cas_preview_frame(preview, show_account_ids)
+            st.dataframe(frame, hide_index=True, width="stretch")
 
 
 def main() -> None:

@@ -4,7 +4,7 @@ A local-first portfolio aggregation foundation named after Alaka, the mythical
 city of treasures. It provides transactional SQLite storage, typed broker adapter
 contracts, opt-in USD/INR quotes, and a Streamlit holdings dashboard.
 
-**Status:** CAS PDF/XLSX uploads can be parsed into a local, session-only holdings
+**Status:** CAS PDF/CSV uploads can be parsed into a local, session-only holdings
 preview. Supported layouts are described below; IBKR Flex remains a stub.
 CAS previews do not update Alaka Vault or portfolio totals. The portfolio dashboard
 shows cost basis, not market value. Total Net Worth remains "Not valued" until
@@ -23,7 +23,8 @@ python -m venv .venv
 ```
 
 For an existing virtual environment, rerun the install command after requirements
-change. XLSX reading uses `openpyxl`; encrypted PDFs use `pypdf` with crypto support.
+change. CSV reading uses Python's standard library; encrypted PDFs use `pypdf`
+with crypto support.
 On macOS/Linux, use `.venv/bin/python` in place of the Windows executable.
 
 No database configuration is required. The database is named **Alaka Vault** and
@@ -52,30 +53,62 @@ authentication and is designed for a trusted, single-user workstation.
 
 ## CAS Uploads
 
-Open **Import CAS**, select a `.pdf` or `.xlsx` statement, enter its PDF password
+Open **Import CAS**, select a `.pdf` or `.csv` statement, enter its PDF password
 if needed, and select **Parse Statement**. The preview lists ISIN, security name,
-quantity, currency, statement price/value when supplied, and source page/sheet.
+asset class, broker/DP, account, quantity, currency, statement price/value when
+supplied, and source page or CSV.
 Missing prices and values remain unknown, not zero. A preview is not a reconciled
 portfolio or a statement of current net worth.
 
+**Statement Price** is the per-unit price or NAV reported in the statement,
+including CDSL's `Last Closing Price`. It is not acquisition cost, paid-up value,
+or a live quote. A hyphen means the statement supplied no recognized value;
+zero remains a valid numeric price. **Statement Value** is the reported holding
+valuation and is not calculated from acquisition cost.
+
 - PDF support covers text-based ruled tables and whitespace-aligned columns,
 	including password-protected PDFs. Scanned images require OCR and are rejected.
-- XLSX support covers holdings sheets with recognizable column headers. Required
+- CSV support covers UTF-8 comma-separated holdings exports, optionally with a
+	byte-order mark (BOM), and recognizable column headers. Required
 	headers are `ISIN` (or `ISIN Code`) and `Quantity`, `Units`, `Closing Balance`,
-	or equivalent supported aliases. Optional fields include `Security Name`,
-	`Market Price`/`NAV`, `Market Value`/`Valuation`, and `Currency` (INR only).
-- Numeric cells accept plain and Indian-grouped decimals. Formula-based numeric
-	fields are rejected; use a values-only workbook. Password-encrypted Excel files
-	and legacy `.xls` files are not supported.
+	or equivalent supported aliases. Optional fields include `Security Name`/`ISIN Name`,
+	`Market Price`/`Last Closing Price`/`NAV`, `Market Value`/`Valuation`, `Currency` (INR only), and
+	`Asset Class`/`Security Type`/`Instrument Type`.
+- Account provenance is read from labelled `DP Name`/`Broker Name`, `DP ID`, and
+	`Client ID` metadata or explicit CSV columns. These are reported labels, not
+	an externally verified broker mapping: a depository participant can differ from
+	the trading broker. Account IDs use `demat:<DP ID>:<Client ID>`, preserving leading
+	zeros and keeping the same ISIN in different accounts distinct. A broker name
+	alone is not enough to identify an account.
+- Account context follows recognized statement sections and PDF continuation
+	pages. Repeated account labels start a fresh section; missing fields are never
+	filled from the previous section. Ambiguous PDF identity remains **Unknown**
+	and produces a preview warning. Invalid CSV account identifiers are rejected.
+	Full identifiers remain local in the parsed records; the preview masks them
+	unless **Show full account IDs** is selected. Masking is not encryption.
+	Recognized legal broker names display as **Groww** or **Zerodha**; the original
+	reported names remain unchanged in parsed records.
+- Asset classes are **Mutual Fund**, **Gold ETF**, **Stock**, and **Bond**, with **Unclassified**
+	for unsupported or ambiguous instruments. Explicit statement types take priority;
+	otherwise local ISIN/name rules infer the category. Gold ETF descriptions refine
+	generic fund/ETF types to **Gold ETF**. Other ETFs, including bond ETFs, remain
+	**Mutual Fund**; gold funds of funds are not direct gold ETFs, and sovereign gold
+	bonds remain **Bond**. Fund units are not treated as direct bonds or stocks.
+	An `INE` prefix alone does not prove an instrument is equity. Classification is
+	a local heuristic, not a lookup against an authoritative instrument master.
+- Numeric fields accept plain and Indian-grouped decimals. Fields containing
+	commas or line breaks must be quoted. Formula-based numeric fields and malformed
+	CSV quoting are rejected. Excel `.xlsx` and `.xls` files are not supported.
 - Repeated headers are skipped. Recognizable transaction sections are excluded;
 	snapshots are never converted into BUY events. Rows are retained separately,
-	not merged across accounts or deduplicated. Account attribution, statement-date
-	reconciliation, and saving snapshots to the vault are not implemented yet.
+	not merged across accounts or deduplicated. Statement-date reconciliation,
+	multi-file consolidation, and saving snapshots to the vault are not implemented
+	yet. The existing holdings schema is not yet an account-aware persistence model.
 - Unknown headers, ambiguous or malformed holdings rows, and empty extractions
 	produce errors. Broker layouts vary; this is not certification of every CAS
 	variant. Tests use generated examples, not real customer statements.
-- Upload limit: 20 MiB; PDF limit: 200 pages; XLSX limits: 50 sheets, 50,000 rows
-	and 100 columns per sheet, and 100 MiB expanded ZIP size.
+- Upload limit: 20 MiB; PDF limit: 200 pages; CSV limits: 50,000 records
+	(including headers and preamble) and 100 columns per record.
 
 Files are sent only to the local Streamlit process and parsed in memory. The app
 does not persist raw uploads or passwords, call external parsers, or log statement
@@ -89,8 +122,10 @@ session ends; clearing Python references is not secure memory erasure.
 | --- | --- |
 | [core/config.py](core/config.py) | Fixed Alaka Vault location and market-data environment validation. |
 | [core/database.py](core/database.py) | Transaction-scoped connections, schema constraints, and local snapshots. |
+| [core/asset_classifier.py](core/asset_classifier.py) | Offline statement-type and ISIN/name classification with an explicit unknown category. |
 | [ingestion/base_parser.py](ingestion/base_parser.py) | Generic parser contract, typed snapshots/events, and parsing exceptions. |
-| [ingestion/parsers.py](ingestion/parsers.py) | CAS PDF/XLSX snapshot extraction and the IBKR Flex XML stub. |
+| [ingestion/account_context.py](ingestion/account_context.py) | Section-scoped broker/DP labels and demat account identity. |
+| [ingestion/parsers.py](ingestion/parsers.py) | CAS PDF/CSV snapshot extraction and the IBKR Flex XML stub. |
 | [core/forex_engine.py](core/forex_engine.py) | Opt-in public FX retrieval and bounded process-local caching. |
 | [core/portfolio_engine.py](core/portfolio_engine.py) | Decimal-based cost aggregation and display formatting. |
 | [ui/app.py](ui/app.py) | Lazy holdings loading, native currency totals, allocation chart, filters, and pagination. |
@@ -153,7 +188,7 @@ does not permit real statements or unignore matching files beneath it.
 ```
 
 Tests cover transaction rollback, constraints, concurrent writers, parser failure
-contracts, generated XLSX and encrypted PDF parsing, upload/password state cleanup,
+contracts, synthetic CSV and encrypted PDF parsing, upload/password state cleanup,
 offline FX behavior, exact cost calculations, lazy UI loading, filtering, and
 pagination. They make no live market requests.
 GitHub Actions runs the same suite with dependencies installed exclusively from

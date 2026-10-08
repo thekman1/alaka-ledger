@@ -6,6 +6,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Generic, List, Literal, Optional, TypeVar, TypedDict
 
+from core.asset_classifier import AssetClass
+
 
 class ParsingError(ValueError):
     """Report an ingestion failure without exposing statement contents."""
@@ -40,11 +42,21 @@ class ParsedTransaction(TypedDict):
     trade_date: date
 
 
-class ParsedHolding(TypedDict):
+class ParsedAccount(TypedDict):
+    """Reported account provenance; absent fields must not be inferred."""
+
+    broker: Optional[str]
+    dp_id: Optional[str]
+    client_id: Optional[str]
+    account_id: Optional[str]
+
+
+class ParsedHolding(ParsedAccount):
     """A CAS snapshot row; statement values are not acquisition costs or trades."""
 
     isin: str
     security_name: str
+    asset_class: AssetClass
     quantity: Decimal
     price: Optional[Decimal]
     market_value: Optional[Decimal]

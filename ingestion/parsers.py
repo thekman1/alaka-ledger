@@ -1,12 +1,14 @@
 """Local CAS snapshot extraction and an explicit IBKR transaction adapter stub."""
 
+import csv
 import re
 from decimal import Decimal, InvalidOperation
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence
-from zipfile import ZipFile
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, List, Optional, Sequence
 
+from core.asset_classifier import classify_asset
+from ingestion.account_context import AccountContext, account_metadata
 from ingestion.base_parser import (
     BaseParser,
     ParsedHolding,
@@ -25,11 +27,15 @@ _MAX_ROWS = 50_000
 _ISIN = re.compile(r"\bIN[A-Z0-9]{10}\b")
 _HEADERS = {
     "isin": {"isin", "isincode"},
-    "security_name": {"security", "securityname", "nameofsecurity", "companyname", "company", "description", "schemename", "nameofthecompany", "nameofcompany", "nameofthecompanysecurity"},
+    "security_name": {"security", "securityname", "nameofsecurity", "companyname", "company", "description", "schemename", "nameofthecompany", "nameofcompany", "nameofthecompanysecurity", "isinname"},
     "quantity": {"quantity", "qty", "units", "balance", "closingbalance", "closingquantity", "currentbalance", "numberofunits", "noofshares", "noofunits", "numberofshares", "totalbalance"},
-    "price": {"price", "marketprice", "unitprice", "nav", "rate", "pricers", "navrs"},
+    "price": {"price", "marketprice", "unitprice", "nav", "rate", "pricers", "navrs", "lastclosingprice"},
     "market_value": {"value", "valuation", "marketvalue", "currentvalue", "valueinrs", "valuers", "valuationrs", "marketvaluers", "currentvaluation"},
     "native_currency": {"currency", "nativecurrency"},
+    "asset_class": {"assetclass", "securitytype", "instrumenttype"},
+    "broker": {"broker", "brokername", "dpname"},
+    "dp_id": {"dpid"},
+    "client_id": {"clientid"},
 }
 
 
@@ -79,16 +85,24 @@ def _number(value: str, *, required: bool = False) -> Optional[Decimal]:
     return number
 
 
-def _parse_rows(rows: Iterable[Sequence[object]], source: str) -> List[ParsedHolding]:
+def _parse_rows(
+    rows: Iterable[Sequence[object]], source: str, account: Optional[AccountContext] = None,
+) -> List[ParsedHolding]:
     """Extract rows under recognized headers; reject ambiguous ISIN-bearing rows."""
     holdings: List[ParsedHolding] = []
     columns: Dict[str, int] = {}
     previous: List[str] = []
     transaction_section = False
+    account = account if account is not None else AccountContext()
     for row_index, row in enumerate(rows):
         if row_index >= _MAX_ROWS:
             raise ParsingError("The statement exceeds the supported row limit.")
         cells = [_text(cell) for cell in row]
+        if not _columns(cells) and account.consume(cells):
+            columns = {}
+            previous = []
+            transaction_section = False
+            continue
         if _transaction_header(cells):
             columns = {}
             previous = []
@@ -128,7 +142,9 @@ def _parse_rows(rows: Iterable[Sequence[object]], source: str) -> List[ParsedHol
         if currency != "INR":
             raise ParsingError("Only INR-denominated CAS holdings are supported.")
         holdings.append(ParsedHolding(
+            **account.snapshot(values),
             isin=values["isin"], security_name=values.get("security_name", ""),
+            asset_class=classify_asset(values["isin"], values.get("security_name", ""), values.get("asset_class", "")),
             quantity=quantity, price=_number(values.get("price", "")),
             market_value=_number(values.get("market_value", "")),
             native_currency=currency, source=source,
@@ -174,19 +190,55 @@ def _pdf_text_rows(page: "Page") -> List[Sequence[object]]:
     return rows
 
 
+def _pdf_rows(page: "Page") -> List[Sequence[object]]:
+    """Interleave table rows and nearby account labels in page reading order."""
+    tables = sorted(page.find_tables(), key=lambda table: table.bbox[1])
+    if not any(_columns([_text(cell) for cell in row]) for table in tables for row in table.extract()):
+        return _pdf_text_rows(page)
+    rows: List[Sequence[object]] = []
+    top = page.bbox[1]
+    for table in tables:
+        if table.bbox[1] < top:
+            raise ParsingError("Overlapping PDF tables cannot be assigned to accounts safely.")
+        if table.bbox[1] > top:
+            region = page.crop((page.bbox[0], top, page.bbox[2], table.bbox[1]))
+            rows.extend(row for row in _pdf_text_rows(region) if account_metadata([_text(cell) for cell in row]))
+        rows.extend(table.extract())
+        top = table.bbox[3]
+    if top < page.bbox[3]:
+        region = page.crop((page.bbox[0], top, page.bbox[2], page.bbox[3]))
+        rows.extend(row for row in _pdf_text_rows(region) if account_metadata([_text(cell) for cell in row]))
+    return rows
+
+
+def _csv_rows(reader: Iterable[List[str]]) -> Iterator[List[str]]:
+    """Bound CSV dimensions and reject shifted columns in holdings rows."""
+    width: Optional[int] = None
+    for row in reader:
+        if len(row) > 100 or any("\x00" in cell for cell in row):
+            raise ParsingError("The CSV has too many columns or contains invalid text.")
+        if _transaction_header(row):
+            width = None
+        elif _columns(row):
+            width = len(row)
+        elif width is not None and any(_ISIN.search(cell) for cell in row) and len(row) != width:
+            raise ParsingError("A CSV holdings row has inconsistent columns. Quote values containing commas.")
+        yield row
+
+
 class CdslCasParser(BaseParser[ParsedHolding]):
     """Read tabular CAS snapshots locally, preserving statement valuation fields.
 
-    Supports text-based PDF tables and XLSX holdings sheets with ISIN and closing
+    Supports text-based PDF tables and CSV holdings exports with ISIN and closing
     quantity headings. Scanned PDFs and unknown layouts are rejected, not guessed.
     Uploaded bytes and PDF passwords are never written to disk by this parser.
     """
 
     def parse_file(self, file_path: Path) -> List[ParsedHolding]:
-        """Read a bounded local PDF/XLSX; use parse_bytes for password-protected PDFs."""
+        """Read a bounded local PDF/CSV; use parse_bytes for password-protected PDFs."""
         suffix = file_path.suffix.lower()
-        if suffix not in {".pdf", ".xlsx"}:
-            raise UnsupportedStatementError("Select a PDF or XLSX CAS statement.")
+        if suffix not in {".pdf", ".csv"}:
+            raise UnsupportedStatementError("Select a PDF or CSV CAS statement.")
         _validate_file(file_path, suffix)
         try:
             with file_path.open("rb") as document:
@@ -202,10 +254,10 @@ class CdslCasParser(BaseParser[ParsedHolding]):
         try:
             if suffix.lower() == ".pdf":
                 holdings = self._pdf(content, password)
-            elif suffix.lower() == ".xlsx":
-                holdings = self._xlsx(content)
+            elif suffix.lower() == ".csv":
+                holdings = self._csv(content)
             else:
-                raise UnsupportedStatementError("Select a PDF or XLSX CAS statement.")
+                raise UnsupportedStatementError("Select a PDF or CSV CAS statement.")
         except ParsingError:
             raise
         except Exception:
@@ -215,25 +267,13 @@ class CdslCasParser(BaseParser[ParsedHolding]):
         return holdings
 
     @staticmethod
-    def _xlsx(content: bytes) -> List[ParsedHolding]:
-        """Read worksheet values without evaluating formulas or external links."""
-        from openpyxl import load_workbook
-
-        with ZipFile(BytesIO(content)) as archive:
-            if sum(entry.file_size for entry in archive.infolist()) > 100 * 1024 * 1024:
-                raise ParsingError("The expanded workbook exceeds the supported size limit.")
-        workbook = load_workbook(BytesIO(content), read_only=True, data_only=False, keep_links=False)
+    def _csv(content: bytes) -> List[ParsedHolding]:
+        """Read UTF-8 CSV, optionally with a BOM, without evaluating formulas."""
         try:
-            if len(workbook.worksheets) > 50:
-                raise ParsingError("The workbook exceeds the supported sheet limit.")
-            holdings: List[ParsedHolding] = []
-            for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
-                if (sheet.max_row or 0) > _MAX_ROWS or (sheet.max_column or 0) > 100:
-                    raise ParsingError("The worksheet exceeds the supported dimensions.")
-                holdings.extend(_parse_rows(sheet.iter_rows(values_only=True), f"Sheet {sheet_index}"))
-            return holdings
-        finally:
-            workbook.close()
+            with StringIO(content.decode("utf-8-sig"), newline="") as stream:
+                return _parse_rows(_csv_rows(csv.reader(stream, strict=True)), "CSV")
+        except (UnicodeDecodeError, csv.Error):
+            raise ParsingError("The CSV must be valid UTF-8 comma-separated text with correctly quoted fields.") from None
 
     @staticmethod
     def _pdf(content: bytes, password: Optional[str]) -> List[ParsedHolding]:
@@ -255,14 +295,11 @@ class CdslCasParser(BaseParser[ParsedHolding]):
         writer.write(decrypted)
         decrypted.seek(0)
         holdings: List[ParsedHolding] = []
+        account = AccountContext(strict=False)
         with pdfplumber.open(decrypted) as document:
             for page_index, page in enumerate(document.pages, start=1):
                 source = f"Page {page_index}"
-                tables = page.extract_tables()
-                rows: List[Sequence[object]] = [row for table in tables for row in table]
-                if not any(_columns([_text(cell) for cell in row]) for row in rows):
-                    rows = _pdf_text_rows(page)
-                holdings.extend(_parse_rows(rows, source))
+                holdings.extend(_parse_rows(_pdf_rows(page), source, account))
         return holdings
 
 
