@@ -91,6 +91,97 @@ class PortfolioTests(unittest.TestCase):
 class AssetClassificationTests(unittest.TestCase):
     """Separate fund units, direct equity and direct debt without network lookups."""
 
+    def test_index_benchmarks_and_compact_names(self) -> None:
+        """Recognise supported equity benchmarks without assuming every index is equity."""
+        from core.asset_classifier import classify_mutual_fund
+
+        for benchmark in (
+            "Nifty 50", "Nifty50", "Nifty Next 50", "Nifty Next50",
+            "Nifty 100", "Nifty100", "Nifty 200", "Nifty200", "Nifty 500", "Nifty500",
+            "Nifty Midcap 150", "Nifty Midcap150", "Nifty Smallcap250",
+            "Nifty Alpha 50", "Nifty Alpha50", "Nifty LargeMidcap 250", "Nifty LargeMidcap250",
+            "Nasdaq 100", "Nasdaq100", "S&P 500", "S&P500", "S P 500", "Sensex30",
+        ):
+            with self.subTest(benchmark=benchmark):
+                category = classify_mutual_fund(f"Synthetic {benchmark} Index Fund")
+                self.assertEqual(category.broad, "Equity")
+        for benchmark in ("Bond", "Nifty G-Sec", "Nifty Debt"):
+            with self.subTest(benchmark=benchmark):
+                category = classify_mutual_fund(f"Synthetic {benchmark} Index Fund")
+                self.assertEqual(category.broad, "Debt")
+        for benchmark in ("", "Nifty", "Nifty5000", "Nasdaq1000", "S&P5000", "Nifty 500 Bond", "Nifty Alpha500", "Nifty Alpha 50 Bond"):
+            with self.subTest(benchmark=benchmark):
+                category = classify_mutual_fund(f"Synthetic {benchmark} Index Fund")
+                self.assertEqual(category.broad, "Unknown")
+
+    def test_elss_precedes_equity_styles_but_not_asset_conflicts(self) -> None:
+        """Keep ELSS as the scheme category when its benchmark also describes equity exposure."""
+        from core.asset_classifier import FundCategory, classify_mutual_fund
+
+        for name in (
+            "Synthetic ELSS Tax Saver Nifty LargeMidcap 250 Index Fund Direct Growth",
+            "Synthetic ELSS Nifty LargeMidcap250 Index Fund",
+            "Synthetic Tax Saver Large & Mid Cap Fund",
+            "Synthetic ELSS Small Cap Fund",
+            "Synthetic ELSS Value Fund",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(classify_mutual_fund(name), FundCategory("Equity", "ELSS"))
+        for name in ("Synthetic ELSS Liquid Fund", "Synthetic ELSS Arbitrage Fund"):
+            with self.subTest(name=name):
+                self.assertEqual(classify_mutual_fund(name), FundCategory("Unknown", "Unknown"))
+
+    def test_compound_cap_and_factor_index_categories(self) -> None:
+        """Classify synthetic statement-style descriptions without retaining private source rows."""
+        from core.asset_classifier import FundCategory, classify_mutual_fund
+
+        cases = (
+            ("NIFTY ALPHA 50", "Index Fund / ETF"),
+            ("NIFTY ALPHA50", "Index Fund / ETF"),
+            ("NIFTY LARGEMIDCAP 250", "Large & Mid Cap"),
+            ("NIFTY LARGEMIDCAP250", "Large & Mid Cap"),
+            ("NIFTY LARGE MIDCAP 250", "Large & Mid Cap"),
+            ("NIFTY LARGE-MID-CAP 250", "Large & Mid Cap"),
+        )
+        for benchmark, scheme in cases:
+            with self.subTest(benchmark=benchmark):
+                name = f"SYNTHETIC AMC#SYNTHETIC MF-SYNTHETIC {benchmark} INDEX FUND-DIRECT-GROWTH"
+                self.assertEqual(classify_mutual_fund(name), FundCategory("Equity", scheme))
+
+    def test_mutual_fund_broad_and_scheme_categories(self) -> None:
+        """Keep broad and detailed categories separate without requiring market data."""
+        from core.asset_classifier import FundCategory, classify_mutual_fund
+
+        cases = [
+            ("Synthetic Flexicap Fund Direct Growth", "Equity", "Flexi Cap"),
+            ("Synthetic Large & Mid Cap Fund", "Equity", "Large & Mid Cap"),
+            ("Synthetic Small-Cap Fund", "Equity", "Small Cap"),
+            ("Synthetic ELSS Tax Saver Fund", "Equity", "ELSS"),
+            ("Synthetic Liquid Fund", "Debt", "Liquid"),
+            ("Synthetic Ultra Short Duration Fund", "Debt", "Ultra Short Duration"),
+            ("Synthetic Medium to Long Duration Fund", "Debt", "Medium to Long Duration"),
+            ("Synthetic Banking & PSU Debt Fund", "Debt", "Banking & PSU"),
+            ("Synthetic Gilt with 10 Year Constant Duration Fund", "Debt", "Gilt - 10 Year Constant Duration"),
+            ("Synthetic Balanced Advantage Fund", "Hybrid", "Balanced Advantage / Dynamic Asset Allocation"),
+            ("Synthetic Multi Asset Allocation Fund", "Hybrid", "Multi Asset Allocation"),
+            ("Synthetic Equity Savings Fund", "Hybrid", "Equity Savings"),
+            ("Synthetic Arbitrage Fund", "Hybrid", "Arbitrage"),
+            ("Synthetic Retirement Fund", "Solution Oriented", "Retirement"),
+            ("Synthetic Nifty 50 Index Fund", "Equity", "Index Fund / ETF"),
+            ("Synthetic Gold ETF Fund of Funds", "Other", "Fund of Funds"),
+            ("Synthetic Equity Fund of Funds", "Equity", "Fund of Funds"),
+            ("Synthetic Bond Fund", "Debt", "Unknown"),
+            ("Synthetic Long Term Equity Fund", "Equity", "Unknown"),
+            ("Synthetic Growth Opportunities Fund", "Unknown", "Unknown"),
+            ("Synthetic Small Cap Liquid Fund", "Unknown", "Unknown"),
+            ("Synthetic Large Cap Small Cap Fund", "Equity", "Unknown"),
+        ]
+        for name, broad, scheme in cases:
+            with self.subTest(name=name):
+                self.assertEqual(classify_mutual_fund(name), FundCategory(broad, scheme))
+        for asset_class in ("Stock", "Bond", "Gold ETF", "Unclassified"):
+            self.assertEqual(classify_mutual_fund("Synthetic Liquid Equity", asset_class), FundCategory(None, None))
+
     def test_instrument_descriptions(self) -> None:
         """Use specific markers while keeping fund holdings out of direct debt/equity."""
         from core.asset_classifier import classify_asset
@@ -131,7 +222,32 @@ class AssetClassificationTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    """Assert unfinished adapters cannot claim an empty successful import."""
+    """Exercise local statement extraction and explicit unsupported-adapter failures."""
+
+    def test_statement_date_metadata(self) -> None:
+        """Read only explicit statement dates and reset metadata on subsequent parses."""
+        from datetime import date
+
+        parser = CdslCasParser()
+        holdings = b"ISIN,Quantity\nINE000A01010,1\n"
+        for preamble in (
+            b"Statement as on : 02-Jan-2026\n",
+            b"Statement as of,2026-01-02\n",
+            b"Statement Date:,02/01/2026\n",
+            b"Statement as on : 02 January 2026\nStatement Date:02-Jan-2026\n",
+        ):
+            with self.subTest(preamble=preamble):
+                parser.parse_bytes(preamble + holdings, ".csv")
+                self.assertEqual(parser.statement_date, date(2026, 1, 2))
+        for preamble in (
+            b"", b"Generated on:02-Jan-2026\n", b"Trade Date:02-Jan-2026\n",
+            b"Statement as on:31-Feb-2026\n", b"Statement Date:01-Jan-9999\n",
+            b"Statement Date:02-Jan-2026\nStatement Date:03-Jan-2026\n",
+            b"Statement Date:02-Jan-2026\nStatement Date:unknown\n",
+        ):
+            with self.subTest(preamble=preamble):
+                parser.parse_bytes(preamble + holdings, ".csv")
+                self.assertIsNone(parser.statement_date)
 
     def test_missing_file(self) -> None:
         """Use a sanitized custom exception for invalid paths."""
@@ -272,7 +388,7 @@ class ParserTests(unittest.TestCase):
         """Bind account labels outside ruled tables to the following holdings section."""
         from unittest.mock import patch
 
-        from ingestion.parsers import _parse_rows, _pdf_rows
+        from ingestion.parsers import _StatementDateContext, _parse_rows, _pdf_rows
 
         first = Mock(bbox=(0, 100, 600, 200))
         first.extract.return_value = [["ISIN", "Balance"], ["INE000A01010", "2"]]
@@ -281,12 +397,15 @@ class ParserTests(unittest.TestCase):
         page = Mock(bbox=(0, 0, 600, 600))
         page.find_tables.return_value = [second, first]
         metadata = [
-            [["DP ID:00000001"], ["Client ID:00000002"], ["DP Name:Synthetic Broker A"]],
+            [["Statement as on : 02-Jan-2026"], ["DP ID:00000001"], ["Client ID:00000002"], ["DP Name:Synthetic Broker A"]],
             [["DP ID:00000003"], ["Client ID:00000004"], ["DP Name:Synthetic Broker B"]],
             [],
         ]
+        dates = _StatementDateContext()
         with patch("ingestion.parsers._pdf_text_rows", side_effect=metadata):
-            holdings = _parse_rows(_pdf_rows(page), "Page 1")
+            holdings = _parse_rows(_pdf_rows(page), "Page 1", statement_dates=dates)
+        self.assertIsNotNone(dates.value)
+        self.assertEqual(str(dates.value), "2026-01-02")
         self.assertEqual([row["account_id"] for row in holdings], ["demat:00000001:00000002", "demat:00000003:00000004"])
         self.assertEqual([row["broker"] for row in holdings], ["Synthetic Broker A", "Synthetic Broker B"])
 
@@ -366,13 +485,16 @@ class ParserTests(unittest.TestCase):
             b"BT /F1 10 Tf 30 285 Td (DP ID: 00000001) Tj "
             b"0 -15 Td (Client ID: 00000002) Tj "
             b"0 -15 Td (DP Name: Synthetic Broker) Tj "
+            b"0 -15 Td (Statement as on : 02-Jan-2026) Tj "
             b"0 -25 Td (ISIN            Security Name          Quantity     Market Value) Tj "
             b"0 -20 Td (INE000A01010    Synthetic Security     12.50        1,250.00) Tj ET"
         )
         page[NameObject("/Contents")] = content
         plain = BytesIO()
         writer.write(plain)
-        result = CdslCasParser().parse_bytes(plain.getvalue(), ".pdf")
+        parser = CdslCasParser()
+        result = parser.parse_bytes(plain.getvalue(), ".pdf")
+        self.assertEqual(str(parser.statement_date), "2026-01-02")
         self.assertEqual(result[0]["quantity"], Decimal("12.50"))
         self.assertEqual(result[0]["market_value"], Decimal("1250.00"))
         self.assertEqual(result[0]["account_id"], "demat:00000001:00000002")
@@ -380,9 +502,12 @@ class ParserTests(unittest.TestCase):
         writer.encrypt("synthetic-password", algorithm="AES-256")
         encrypted = BytesIO()
         writer.write(encrypted)
+        encrypted_content = encrypted.getvalue()
         with self.assertRaises(ParsingError):
-            CdslCasParser().parse_bytes(encrypted.getvalue(), ".pdf", "wrong")
-        parsed = CdslCasParser().parse_bytes(encrypted.getvalue(), ".pdf", "synthetic-password")
+            parser.parse_bytes(encrypted_content, ".pdf", "wrong")
+        self.assertIsNone(parser.statement_date)
+        parsed = parser.parse_bytes(encrypted_content, ".pdf", "synthetic-password")
+        self.assertEqual(str(parser.statement_date), "2026-01-02")
         self.assertEqual(parsed, result)
 
 

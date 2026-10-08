@@ -2,6 +2,7 @@
 
 import os
 import unittest
+from datetime import date
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -101,6 +102,130 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(app.dataframe[0].value.iloc[0]["Account"], "DP ****0001 / Client ****0002")
             app.checkbox[0].check().run()
             self.assertEqual(app.dataframe[0].value.iloc[0]["Account"], "demat:00000001:00000002")
+            self.assertFalse(self.path.exists())
+
+    def test_save_to_vault_and_fresh_session_reload(self) -> None:
+        """Require confirmation, save explicitly, and reload persisted holdings in a fresh session."""
+        content = (
+            b"DP ID:00000001\nClient ID:00000002\nDP Name:Synthetic Broker\n"
+            b"ISIN,ISIN Name,Quantity,Last Closing Price\n"
+            b"INE000A01010,Synthetic Equity Shares,12.50,100\n"
+        )
+        uploaded = SimpleNamespace(name="synthetic.csv", size=len(content), getvalue=lambda: content)
+        with patch("streamlit.file_uploader", return_value=uploaded):
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            app.button[1].click().run()
+            self.assertIsNone(app.date_input[0].value)
+            self.assertTrue(app.button[2].disabled)
+            self.assertFalse(self.path.exists())
+            app.date_input[0].set_value(date(2026, 1, 2)).run()
+            app.checkbox[1].check().run()
+            self.assertFalse(app.button[2].disabled)
+            app.button[2].click().run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.error)
+            self.assertIn("Saved 1 account", app.success[0].value)
+            self.assertTrue(self.path.exists())
+            self.assertEqual(app.dataframe[1].value.iloc[0]["Statement Date"], "2026-01-02")
+            app.button[2].click().run()
+            self.assertFalse(app.exception)
+            self.assertIn("Already saved", app.success[0].value)
+            app.date_input[0].set_value(date(2026, 1, 3)).run()
+            self.assertFalse(app.success)
+            app.button[2].click().run()
+            self.assertIn("different statement date", app.error[0].value)
+        fresh = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+        fresh.button[0].click().run()
+        self.assertFalse(fresh.exception)
+        self.assertEqual(len(fresh.dataframe[0].value), 1)
+        self.assertEqual(fresh.dataframe[0].value.iloc[0]["Quantity"], "12.5")
+        self.assertEqual(fresh.dataframe[0].value.iloc[0]["Account"], "DP ****0001 / Client ****0002")
+        fresh.selectbox[0].set_value(1).run()
+        self.assertFalse(fresh.exception)
+        self.assertEqual(fresh.dataframe[0].value.iloc[0]["Statement Date"], "2026-01-02")
+        self.assertEqual(Database(self.path).load_holdings(), [])
+
+    def test_statement_date_autofill_and_edit(self) -> None:
+        """Prefill the parsed date once, retain edits across reruns, and save the edited date."""
+        holdings = (
+            b"DP ID:00000001\nClient ID:00000002\nDP Name:Synthetic Broker\n"
+            b"ISIN,Quantity\nINE000A01010,1\n"
+        )
+        content = b"Statement as on : 02-Jan-2026\n" + holdings
+        uploaded = SimpleNamespace(name="synthetic.csv", size=len(content), getvalue=lambda: content)
+        with patch("streamlit.file_uploader", return_value=uploaded):
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            app.button[1].click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(app.date_input[0].value, date(2026, 1, 2))
+            self.assertTrue(app.button[2].disabled)
+            self.assertFalse(self.path.exists())
+            app.date_input[0].set_value(date(2026, 1, 3)).run()
+            app.checkbox[0].check().run()
+            self.assertEqual(app.date_input[0].value, date(2026, 1, 3))
+            app.checkbox[1].check().run()
+            app.button[2].click().run()
+            self.assertFalse(app.exception)
+            self.assertFalse(app.error)
+            self.assertEqual(Database(self.path).list_snapshots()[0]["statement_date"], "2026-01-03")
+            content = b"Statement Date:04-Jan-2026\n" + holdings
+            app.run()
+            app.button[1].click().run()
+            self.assertEqual(app.date_input[0].value, date(2026, 1, 4))
+            self.assertFalse(app.success)
+            self.assertFalse(app.checkbox[1].value)
+            content = holdings
+            app.run()
+            app.button[1].click().run()
+            self.assertFalse(app.exception)
+            self.assertIsNone(app.date_input[0].value)
+
+    def test_fund_categories_in_preview_and_saved_holdings(self) -> None:
+        """Display both scheme levels before and after saving without changing asset classes."""
+        content = (
+            b"Statement Date:02-Jan-2026\nDP ID:00000001\nClient ID:00000002\nDP Name:Synthetic Broker\n"
+            b"ISIN,ISIN Name,Quantity\n"
+            b"INF000A01010,Synthetic Flexi Cap Fund Direct Growth,1\n"
+            b"INF000B01010,Synthetic Liquid Fund,2\n"
+            b"INF000C01010,Synthetic Arbitrage Fund,3\n"
+            b"INF000D01010,Synthetic Opportunities Fund,4\n"
+            b"INF000E01010,Synthetic Gold ETF,5\n"
+            b"INF000F01010,Synthetic ELSS Tax Saver Nifty LargeMidcap 250 Index Fund Direct Growth,6\n"
+        )
+        uploaded = SimpleNamespace(name="synthetic.csv", size=len(content), getvalue=lambda: content)
+        with patch("streamlit.file_uploader", return_value=uploaded):
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            app.button[1].click().run()
+            self.assertFalse(app.exception)
+            preview = app.dataframe[0].value
+            self.assertEqual(preview["Fund Category"].tolist(), ["Equity", "Debt", "Hybrid", "Unknown", "-", "Equity"])
+            self.assertEqual(preview["Scheme Category"].tolist(), ["Flexi Cap", "Liquid", "Arbitrage", "Unknown", "-", "ELSS"])
+            self.assertEqual(preview["Asset Class"].tolist(), ["Mutual Fund"] * 4 + ["Gold ETF", "Mutual Fund"])
+            self.assertFalse(self.path.exists())
+            app.checkbox[1].check().run()
+            app.button[2].click().run()
+            self.assertFalse(app.error)
+        fresh = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+        fresh.button[0].click().run()
+        self.assertFalse(fresh.exception)
+        saved = fresh.dataframe[0].value
+        self.assertEqual(saved["Fund Category"].tolist(), preview["Fund Category"].tolist())
+        self.assertEqual(saved["Scheme Category"].tolist(), preview["Scheme Category"].tolist())
+        fresh.selectbox[0].set_value(1).run()
+        self.assertFalse(fresh.exception)
+        self.assertEqual(fresh.dataframe[0].value["Scheme Category"].tolist(), preview["Scheme Category"].tolist())
+
+    def test_unknown_account_cannot_be_saved(self) -> None:
+        """Keep ambiguous-account previews usable without permitting unsafe persistence."""
+        content = b"ISIN,Quantity\nINE000A01010,1\n"
+        uploaded = SimpleNamespace(name="synthetic.csv", size=len(content), getvalue=lambda: content)
+        with patch("streamlit.file_uploader", return_value=uploaded):
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            app.button[1].click().run()
+            app.date_input[0].set_value(date(2026, 1, 2)).run()
+            app.checkbox[1].check().run()
+            self.assertFalse(app.exception)
+            self.assertTrue(app.button[2].disabled)
             self.assertFalse(self.path.exists())
 
     def test_inr_distribution_renders(self) -> None:

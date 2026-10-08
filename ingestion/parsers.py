@@ -2,6 +2,7 @@
 
 import csv
 import re
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 _MAX_BYTES = 20 * 1024 * 1024
 _MAX_ROWS = 50_000
 _ISIN = re.compile(r"\bIN[A-Z0-9]{10}\b")
+_STATEMENT_DATE_LABEL = re.compile(r"\bstatement\s+(?:as\s+(?:on|of)|date)\s*:?\s*", re.IGNORECASE)
 _HEADERS = {
     "isin": {"isin", "isincode"},
     "security_name": {"security", "securityname", "nameofsecurity", "companyname", "company", "description", "schemename", "nameofthecompany", "nameofcompany", "nameofthecompanysecurity", "isinname"},
@@ -85,8 +87,46 @@ def _number(value: str, *, required: bool = False) -> Optional[Decimal]:
     return number
 
 
+def _labelled_date(text: str) -> Optional[date]:
+    """Read explicit day-first or ISO dates without guessing transaction or print dates."""
+    tokens = text.replace(",", " ").split()
+    if not tokens:
+        return None
+    for candidate in (tokens[0], " ".join(tokens[:3])):
+        for pattern in ("%d-%b-%Y", "%d-%B-%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d %b %Y", "%d %B %Y"):
+            try:
+                parsed = datetime.strptime(candidate, pattern).date()
+            except ValueError:
+                continue
+            return parsed if date(1900, 1, 1) <= parsed <= date.today() else None
+    return None
+
+
+class _StatementDateContext:
+    """Resolve repeated explicit labels only when they agree on one valid date."""
+
+    def __init__(self) -> None:
+        self.dates: set[Optional[date]] = set()
+
+    def consume(self, cells: Sequence[str]) -> bool:
+        """Inspect metadata rows without confusing security descriptions with labels."""
+        text = " ".join(cells)
+        if _ISIN.search(text):
+            return False
+        labels = list(_STATEMENT_DATE_LABEL.finditer(text))
+        for label in labels:
+            self.dates.add(_labelled_date(text[label.end():]))
+        return bool(labels)
+
+    @property
+    def value(self) -> Optional[date]:
+        """Leave missing, invalid or conflicting metadata for explicit user input."""
+        return next(iter(self.dates)) if len(self.dates) == 1 else None
+
+
 def _parse_rows(
     rows: Iterable[Sequence[object]], source: str, account: Optional[AccountContext] = None,
+    statement_dates: Optional[_StatementDateContext] = None,
 ) -> List[ParsedHolding]:
     """Extract rows under recognized headers; reject ambiguous ISIN-bearing rows."""
     holdings: List[ParsedHolding] = []
@@ -98,6 +138,9 @@ def _parse_rows(
         if row_index >= _MAX_ROWS:
             raise ParsingError("The statement exceeds the supported row limit.")
         cells = [_text(cell) for cell in row]
+        if statement_dates is not None and statement_dates.consume(cells):
+            account.consume(cells)
+            continue
         if not _columns(cells) and account.consume(cells):
             columns = {}
             previous = []
@@ -190,6 +233,12 @@ def _pdf_text_rows(page: "Page") -> List[Sequence[object]]:
     return rows
 
 
+def _pdf_metadata(row: Sequence[object]) -> bool:
+    """Retain account and statement-date labels surrounding ruled tables."""
+    cells = [_text(cell) for cell in row]
+    return bool(account_metadata(cells) or _STATEMENT_DATE_LABEL.search(" ".join(cells)))
+
+
 def _pdf_rows(page: "Page") -> List[Sequence[object]]:
     """Interleave table rows and nearby account labels in page reading order."""
     tables = sorted(page.find_tables(), key=lambda table: table.bbox[1])
@@ -202,12 +251,12 @@ def _pdf_rows(page: "Page") -> List[Sequence[object]]:
             raise ParsingError("Overlapping PDF tables cannot be assigned to accounts safely.")
         if table.bbox[1] > top:
             region = page.crop((page.bbox[0], top, page.bbox[2], table.bbox[1]))
-            rows.extend(row for row in _pdf_text_rows(region) if account_metadata([_text(cell) for cell in row]))
+            rows.extend(row for row in _pdf_text_rows(region) if _pdf_metadata(row))
         rows.extend(table.extract())
         top = table.bbox[3]
     if top < page.bbox[3]:
         region = page.crop((page.bbox[0], top, page.bbox[2], page.bbox[3]))
-        rows.extend(row for row in _pdf_text_rows(region) if account_metadata([_text(cell) for cell in row]))
+        rows.extend(row for row in _pdf_text_rows(region) if _pdf_metadata(row))
     return rows
 
 
@@ -234,6 +283,9 @@ class CdslCasParser(BaseParser[ParsedHolding]):
     Uploaded bytes and PDF passwords are never written to disk by this parser.
     """
 
+    def __init__(self) -> None:
+        self.statement_date: Optional[date] = None
+
     def parse_file(self, file_path: Path) -> List[ParsedHolding]:
         """Read a bounded local PDF/CSV; use parse_bytes for password-protected PDFs."""
         suffix = file_path.suffix.lower()
@@ -249,13 +301,15 @@ class CdslCasParser(BaseParser[ParsedHolding]):
 
     def parse_bytes(self, content: bytes, suffix: str, password: Optional[str] = None) -> List[ParsedHolding]:
         """Parse an in-memory upload; sanitize third-party exceptions at the boundary."""
+        self.statement_date = None
+        statement_dates = _StatementDateContext()
         if not content or len(content) > _MAX_BYTES:
             raise ParsingError("Select a nonempty statement no larger than 20 MiB.")
         try:
             if suffix.lower() == ".pdf":
-                holdings = self._pdf(content, password)
+                holdings = self._pdf(content, password, statement_dates)
             elif suffix.lower() == ".csv":
-                holdings = self._csv(content)
+                holdings = self._csv(content, statement_dates)
             else:
                 raise UnsupportedStatementError("Select a PDF or CSV CAS statement.")
         except ParsingError:
@@ -264,19 +318,20 @@ class CdslCasParser(BaseParser[ParsedHolding]):
             raise ParsingError("The statement could not be parsed. Check its format and PDF password.") from None
         if not holdings:
             raise ParsingError("No supported holdings table found. Scanned PDFs require OCR; unknown layouts are not imported.")
+        self.statement_date = statement_dates.value
         return holdings
 
     @staticmethod
-    def _csv(content: bytes) -> List[ParsedHolding]:
+    def _csv(content: bytes, statement_dates: _StatementDateContext) -> List[ParsedHolding]:
         """Read UTF-8 CSV, optionally with a BOM, without evaluating formulas."""
         try:
             with StringIO(content.decode("utf-8-sig"), newline="") as stream:
-                return _parse_rows(_csv_rows(csv.reader(stream, strict=True)), "CSV")
+                return _parse_rows(_csv_rows(csv.reader(stream, strict=True)), "CSV", statement_dates=statement_dates)
         except (UnicodeDecodeError, csv.Error):
             raise ParsingError("The CSV must be valid UTF-8 comma-separated text with correctly quoted fields.") from None
 
     @staticmethod
-    def _pdf(content: bytes, password: Optional[str]) -> List[ParsedHolding]:
+    def _pdf(content: bytes, password: Optional[str], statement_dates: _StatementDateContext) -> List[ParsedHolding]:
         """Decrypt in memory and extract ruled or whitespace-aligned text tables."""
         import pdfplumber
         from pypdf import PdfReader, PdfWriter
@@ -299,7 +354,7 @@ class CdslCasParser(BaseParser[ParsedHolding]):
         with pdfplumber.open(decrypted) as document:
             for page_index, page in enumerate(document.pages, start=1):
                 source = f"Page {page_index}"
-                holdings.extend(_parse_rows(_pdf_rows(page), source, account))
+                holdings.extend(_parse_rows(_pdf_rows(page), source, account, statement_dates))
         return holdings
 
 
