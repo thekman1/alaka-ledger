@@ -1,0 +1,1 @@
+"""Streamlit presentation layer; no ingestion or SQL logic belongs here."""

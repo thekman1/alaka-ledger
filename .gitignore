@@ -1,0 +1,41 @@
+# Local Financial Data (CRITICAL - Never commit actual statements)
+*.pdf
+*.csv
+*.xlsx
+*.xls
+*.json
+!data/templates/
+
+# Local Databases & State
+*.db
+*.sqlite
+*.sqlite3
+.local/
+data/*.db
+
+# Environment Variables & Credentials
+.env
+.env.local
+.env.*.local
+secrets.toml
+.streamlit/secrets.toml
+
+# Python Build, Cache & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.egg-info/
+
+# OS Specific
+.DS_Store
+.DS_Store?
+ehthumbs.db
+Thumbs.db

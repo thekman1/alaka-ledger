@@ -1,0 +1,1 @@
+"""Statement normalization contracts, independent of persistence and presentation."""

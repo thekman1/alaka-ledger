@@ -1,0 +1,22 @@
+[browser]
+gatherUsageStats = false
+
+[server]
+address = "127.0.0.1"
+headless = true
+fileWatcherType = "none"
+enableCORS = true
+enableXsrfProtection = true
+enableStaticServing = false
+
+[client]
+showErrorDetails = "none"
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#087F8C"
+backgroundColor = "#FAFCFC"
+secondaryBackgroundColor = "#EEF2F2"
+textColor = "#20292B"
+font = "monospace"

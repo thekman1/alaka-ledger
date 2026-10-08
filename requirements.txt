@@ -1,0 +1,20 @@
+# Core Framework & Dashboard UI
+streamlit>=1.35.0,<2.0.0
+plotly>=5.20.0,<6.0.0
+
+# Data Engineering & Science Stack
+pandas>=2.2.0,<3.0.0
+numpy>=1.26.0,<2.0.0
+
+# Financial Market Data & API Caching
+yfinance>=0.2.40
+requests>=2.32.0,<3.0.0
+
+# Document Ingestion & Parsers
+pdfplumber>=0.11.0
+pypdf[crypto]>=4.2.0
+openpyxl>=3.1.5,<4.0.0
+defusedxml>=0.7.1,<1.0.0
+
+# Infrastructure Management
+python-dotenv>=1.0.1

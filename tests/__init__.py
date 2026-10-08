@@ -1,0 +1,1 @@
+"""Synthetic-only tests; never use real statements or account identifiers."""
